@@ -1,0 +1,148 @@
+import numpy as np
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def make_demo_dataset(n_rows=600, random_state=42):
+    """Create illustrative data; values are synthetic, not field observations."""
+    rng = np.random.default_rng(random_state)
+
+    rainfall = rng.uniform(250, 1200, n_rows)          # mm per growing season
+    temperature = rng.uniform(18, 38, n_rows)          # average °C
+    soil_ph = rng.uniform(4.8, 8.2, n_rows)
+    fertilizer = rng.uniform(20, 180, n_rows)          # kg/ha
+    irrigation = rng.choice(["None", "Partial", "Full"], n_rows, p=[0.35, 0.35, 0.30])
+    crop = rng.choice(["Wheat", "Rice", "Maize"], n_rows)
+    season = rng.choice(["Kharif", "Rabi", "Zaid"], n_rows)
+
+    crop_factor = pd.Series(crop).map({"Wheat": 0.9, "Rice": 1.15, "Maize": 1.0}).to_numpy()
+    irrigation_factor = pd.Series(irrigation).map(
+        {"None": 0.78, "Partial": 0.93, "Full": 1.05}
+    ).to_numpy()
+    season_factor = pd.Series(season).map(
+        {"Kharif": 1.02, "Rabi": 1.0, "Zaid": 0.88}
+    ).to_numpy()
+
+    # Illustrative non-linear response with random noise.
+    rainfall_effect = 1.0 - ((rainfall - 700) / 900) ** 2
+    temperature_effect = np.clip(1.0 - ((temperature - 27) / 18) ** 2, 0.45, 1.0)
+    ph_effect = np.clip(1.0 - ((soil_ph - 6.5) / 3.2) ** 2, 0.55, 1.0)
+    yield_tonnes_per_ha = (
+        1.2 + 3.3 * rainfall_effect * temperature_effect * ph_effect
+        + 0.012 * fertilizer
+    ) * crop_factor * irrigation_factor * season_factor
+    yield_tonnes_per_ha += rng.normal(0, 0.35, n_rows)
+    yield_tonnes_per_ha = np.clip(yield_tonnes_per_ha, 0.2, None)
+
+    df = pd.DataFrame({
+        "rainfall_mm": rainfall,
+        "avg_temperature_c": temperature,
+        "soil_ph": soil_ph,
+        "fertilizer_kg_ha": fertilizer,
+        "irrigation": irrigation,
+        "crop": crop,
+        "season": season,
+        "yield_tonnes_per_ha": yield_tonnes_per_ha,
+    })
+
+    # Add a few missing values to demonstrate imputation.
+    for column in ["rainfall_mm", "soil_ph", "irrigation"]:
+        missing_rows = rng.choice(df.index, size=max(1, n_rows // 50), replace=False)
+        df.loc[missing_rows, column] = np.nan
+
+    return df
+
+
+def build_preprocessor(numeric_features, categorical_features, scale_numeric=False):
+    """Build preprocessing that is fitted only on training data through a Pipeline."""
+    numeric_steps = [("imputer", SimpleImputer(strategy="median"))]
+    if scale_numeric:
+        numeric_steps.append(("scaler", StandardScaler()))
+
+    numeric_pipeline = Pipeline(steps=numeric_steps)
+    categorical_pipeline = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+    ])
+
+    return ColumnTransformer(transformers=[
+        ("numeric", numeric_pipeline, numeric_features),
+        ("categorical", categorical_pipeline, categorical_features),
+    ])
+
+
+def evaluate_model(name, model, X_train, X_test, y_train, y_test):
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, predictions))
+    return {
+        "Model": name,
+        "MAE": mean_absolute_error(y_test, predictions),
+        "RMSE": rmse,
+        "R2": r2_score(y_test, predictions),
+    }
+
+
+def main():
+    df = make_demo_dataset()
+    target = "yield_tonnes_per_ha"
+    X = df.drop(columns=[target])
+    y = df[target]
+
+    numeric_features = [
+        "rainfall_mm", "avg_temperature_c", "soil_ph", "fertilizer_kg_ha"
+    ]
+    categorical_features = ["irrigation", "crop", "season"]
+
+    # Hold out test data before fitting any preprocessing steps.
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=42
+    )
+
+    linear_model = Pipeline(steps=[
+        ("preprocessor", build_preprocessor(
+            numeric_features, categorical_features, scale_numeric=True
+        )),
+        ("regressor", LinearRegression()),
+    ])
+
+    forest_model = Pipeline(steps=[
+        ("preprocessor", build_preprocessor(
+            numeric_features, categorical_features, scale_numeric=False
+        )),
+        ("regressor", RandomForestRegressor(
+            n_estimators=300,
+            max_depth=None,
+            min_samples_leaf=2,
+            random_state=42,
+            n_jobs=-1,
+        )),
+    ])
+
+    results = [
+        evaluate_model("Linear Regression (baseline)", linear_model,
+                       X_train, X_test, y_train, y_test),
+        evaluate_model("Random Forest (candidate)", forest_model,
+                       X_train, X_test, y_train, y_test),
+    ]
+
+    results_df = pd.DataFrame(results).sort_values("RMSE")
+    print("\nModel comparison (synthetic demo data):")
+    print(results_df.to_string(index=False, float_format=lambda value: f"{value:.3f}"))
+
+    best_name = results_df.iloc[0]["Model"]
+    print(f"\nLowest test RMSE in this demo: {best_name}")
+    print("Reminder: synthetic-data scores are illustrative only.")
+    print("For deployment, validate with real, time-aware and/or location-aware splits.")
+
+
+if __name__ == "__main__":
+    main()
